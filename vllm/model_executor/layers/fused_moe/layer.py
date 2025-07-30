@@ -463,6 +463,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
             )
+        self.update_expert_load(tokp_ids=topk_ids,expert_load_view=expert_load_view,expert_map=expert_map,)
 
     def forward_cpu(
         self,
@@ -1294,78 +1295,37 @@ class FusedMoE(torch.nn.Module):
             if indices_type is not None:
                 topk_ids = topk_ids.to(dtype=indices_type)
 
-        if enable_eplb:
-            assert expert_load_view is not None
-            assert logical_to_physical_map is not None
-            assert logical_replica_count is not None
-
-            # 1. Convert the logical expert ids to physical expert ids
-            # Directly select a random replica for each logical expert
-
-            # TODO: maybe optimize this by using specified kernels,
-            # or compute pseudo-random indices by modulo
-
-            # In case `indices_type` is not `torch.long` or `torch.int`,
-            # e.g. `torch.uint32` as required by dispatch/combine kernels
-            topk_ids_long = topk_ids.long()
-            replica_indices = (
-                torch.rand_like(topk_ids, dtype=torch.float) *
-                logical_replica_count[topk_ids_long]).long().unsqueeze(-1)
-            physical_ids = logical_to_physical_map[topk_ids_long].gather(
-                -1, replica_indices).squeeze(-1)
-
-            topk_ids = physical_ids
-
-            # 2. Record expert load metrics.
-
-            # TODO(bowen): When using `FusedMoEModularKernel`, this
-            # can be done in a more unified way, since
-            # `FusedMoEPrepareAndFinalize` will return the expert
-            # token count, in some cases directly from the kernel.
-            # However, now there are many code paths not using
-            # the modular kernel, e.g. calling `fused_experts`,
-            # so we decide to keep the logic here.
-            #
-            # If later refactor moved all the MoE kernel calls
-            # to the modular kernel, we can move this logic there
-            # to achieve better efficiency.
-
-            # `expert_load_view`: (num_logical_experts,)
-
-            # Mask out non-local experts
-            if expert_map is not None:
-                topk_ids_local = expert_map[topk_ids]
-                topk_ids_flatten = topk_ids_local.flatten()
-            else:
-                topk_ids_flatten = topk_ids.flatten()
-
-            # Should be equivalent to:
-            # ```
-            # topk_ids_masked = topk_ids_local[topk_ids_local >= 0]
-            # expert_load_view += topk_ids_masked.bincount(
-            #     minlength=expert_load_view.shape[0])
-            # ```
-            # We use `scatter_add_` since `bincount` cannot be compiled
-
-            # Performance optimization:
-            # `masked_fill` is significantly faster than `masked_select`
-            invalid_mask = topk_ids_flatten < 0
-            # Replace invalid expert ids with 0 (just a dummy position)
-            # to avoid out-of-bounds errors in scatter_add_
-            index = topk_ids_flatten.masked_fill_(invalid_mask, 0)
-            # `src` is the valid mask, which is 1 for valid and 0 for invalid
-            src = ~invalid_mask
-
-            expert_load_view.scatter_add_(dim=0,
-                                          index=index.long(),
-                                          src=src.to(expert_load_view))
-
-            topk_ids = topk_ids.to(dtype=indices_type)
-
         assert topk_ids.dtype == indices_type or indices_type is None
 
         return topk_weights, topk_ids
 
+    def update_expert_load(
+        topk_ids: torch.Tensor,
+        expert_load_view: torch.Tensor,
+        expert_map: Optional[torch.Tensor] = None,) -> None:
+    # 将topk_ids展平为一维张量，便于批量处理
+        if expert_map is not None:
+            # 转换全局ID到本地ID
+            topk_ids_local = expert_map[topk_ids]
+            topk_ids_flatten = topk_ids_local.flatten()
+        else:
+            topk_ids_flatten = topk_ids.flatten()
+        
+        # 标记无效的专家ID（小于0的ID）
+        invalid_mask = topk_ids_flatten < 0
+        
+        # 将无效ID替换为0（避免scatter_add_越界），有效ID保持不变
+        index = topk_ids_flatten.masked_fill_(invalid_mask, 0)
+        
+        # 有效掩码：1表示有效ID，0表示无效ID
+        src = ~invalid_mask
+        
+        # 累加每个本地专家的负载计数
+        expert_load_view.scatter_add_(
+            dim=0,
+            index=index.long(),  # 确保索引为长整型
+            src=src.to(expert_load_view.dtype)  # 转换为与负载视图相同的数据类型
+        )
     def must_reduce_shared_expert_outputs(self) -> bool:
         """
         The shared_experts are typically computed using the RowParallelLinear
@@ -1499,7 +1459,7 @@ class FusedMoE(torch.nn.Module):
         if do_naive_dispatch_combine:
             hidden_states, router_logits = get_ep_group().dispatch(
                 hidden_states, router_logits)
-
+        
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
             layer=self,
