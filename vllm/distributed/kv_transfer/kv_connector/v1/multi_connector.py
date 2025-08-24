@@ -14,6 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
@@ -52,7 +53,7 @@ class MultiConnector(KVConnectorBase_V1):
             temp_config.kv_transfer_config = KVTransferConfig(
                 **ktc, engine_id=engine_id)
             self._connectors.append(
-                KVConnectorFactory.create_connector_v1(temp_config, role))
+                KVConnectorFactory.create_connector(temp_config, role))
 
         # A mapping from request id to the index of the connector chosen to
         # load the request from (if any).
@@ -107,15 +108,17 @@ class MultiConnector(KVConnectorBase_V1):
 
     def get_finished(
         self, finished_req_ids: set[str]
-    ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+    ) -> tuple[Optional[set[str]], Optional[set[str]], Optional[set[str]]]:
         finished_sending: set[str] = set()
         finished_recving: set[str] = set()
+        failure_request: set[str] = set()
         for c in self._connectors:
-            sending, recving = c.get_finished(finished_req_ids)
-            if not recving and not sending:
+            sending, recving, failure = c.get_finished(finished_req_ids)
+            if not recving and not sending and not failure:
                 continue
             # Aggregate finished recving request ids.
             finished_recving.update(recving or ())
+            failure_request.update(failure or ())
             # Aggregate finished sending request ids - only include
             # once we've drained the "extra" count (for cases where
             # more than one connector is async-saving the same request).
@@ -130,7 +133,8 @@ class MultiConnector(KVConnectorBase_V1):
                 else:
                     self._extra_async_saves[req_id] = extra_pending - 1
 
-        return finished_sending or None, finished_recving or None
+        return (finished_sending or None, finished_recving
+                or None, failure_request or None)
 
     # ==============================
     # Scheduler-side methods
@@ -177,6 +181,10 @@ class MultiConnector(KVConnectorBase_V1):
             self._extra_async_saves = {}
         return metadata
 
+    def update_connector_output(self, connector_output: KVConnectorOutput):
+        for c in self._connectors:
+            c.update_connector_output(connector_output)
+
     def request_finished(
         self,
         request: "Request",
@@ -202,3 +210,37 @@ class MultiConnector(KVConnectorBase_V1):
         self._requests_to_connector.pop(request.request_id, None)
 
         return async_saves > 0, kv_txfer_params
+
+    @classmethod
+    def get_required_kvcache_layout(
+            cls, vllm_config: "VllmConfig") -> Optional[str]:
+        """
+        Get the required KV cache layout for this connector.
+        Args:
+            vllm_config (VllmConfig): the vllm config.
+
+        Returns:
+            str: the required KV cache layout. e.g. HND, or NHD.
+            None if the connector does not require a specific layout.
+        """
+        ktcs = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "connectors")
+        assert ktcs is not None
+        layouts: set[str] = set()
+        temp_vllm_config = copy.copy(vllm_config)
+        for ktc in ktcs:
+            kv_transfer_config = KVTransferConfig(**ktc)
+            temp_vllm_config.kv_transfer_config = kv_transfer_config
+            connector_cls = KVConnectorFactory.get_connector_class(
+                kv_transfer_config)
+            required_kvcache_layout = (
+                connector_cls.get_required_kvcache_layout(temp_vllm_config))
+            if required_kvcache_layout is not None:
+                layouts.add(required_kvcache_layout)
+
+        if len(layouts) > 1:
+            raise ValueError(f"KV cache layout mismatch: "
+                             f"found {len(layouts)} different layouts "
+                             f"({', '.join(layouts) })."
+                             f"All connectors must use the same layout.")
+        return next(iter(layouts), None)

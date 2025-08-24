@@ -29,7 +29,8 @@ from vllm.distributed.utils import divide
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.platforms import _Backend, current_platform
-from vllm.utils import make_zmq_path, make_zmq_socket, round_down
+from vllm.utils import make_zmq_path, make_zmq_socket
+from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
 
@@ -73,6 +74,7 @@ class NixlAgentMetadata(
     num_blocks: int
     block_len: int
     attn_backend_name: str
+    kv_cache_layout: str
 
 
 @dataclass
@@ -134,6 +136,25 @@ class NixlConnector(KVConnectorBase_V1):
                 vllm_config, self.engine_id)
 
     ############################################################
+    # Class Methods
+    ############################################################
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: VllmConfig):
+        if vllm_config.model_config is None:
+            logger.warning_once("Unable to detect current VLLM config. "
+                                "Fallback to default kv cache layout.")
+            return None
+        use_mla = vllm_config.model_config.use_mla
+        if use_mla:
+            # return None when we have mla
+            # as the layout should not matter in that case,
+            # which fallback to the default behavior.
+            return None
+        logger.info_once("NixlConnector setting KV cache "
+                         "layout to HND for better xfer performance.")
+        return "HND"
+
+    ############################################################
     # Scheduler Side Methods
     ############################################################
 
@@ -177,8 +198,10 @@ class NixlConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         self.connector_worker.set_host_xfer_buffer_ops(copy_operation)
 
-    def get_finished(self,
-                     finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+    def get_finished(
+        self,
+        finished_req_ids: set[str],
+    ) -> tuple[set[str], set[str], set[str]]:
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
@@ -236,13 +259,13 @@ class NixlConnectorScheduler:
         """
         For remote prefill, pull all prompt blocks from remote
         asynchronously relative to engine execution.
-        
+
         Args:
             request (Request): the request object.
             num_computed_tokens (int): the number of locally
                 computed tokens for this request
         Returns:
-            * the number of tokens that can be loaded from the 
+            * the number of tokens that can be loaded from the
               external KV cache beyond what is already computed.
             * true if the external KV cache tokens will be loaded
               asynchronously (between scheduler steps).
@@ -256,10 +279,7 @@ class NixlConnectorScheduler:
 
         if params is not None and params.get("do_remote_prefill"):
             # Remote prefill: get all prompt blocks from remote.
-            assert num_computed_tokens % self.block_size == 0
-            rounded_num_prompt_tokens = round_down(
-                len(request.prompt_token_ids), self.block_size)
-            count = max(rounded_num_prompt_tokens - num_computed_tokens, 0)
+            count = len(request.prompt_token_ids) - num_computed_tokens
             if count > 0:
                 return count, True
 
@@ -282,18 +302,16 @@ class NixlConnectorScheduler:
             # NOTE: when accelerator is not directly supported by Nixl,
             # prefilled blocks need to be saved to host memory before transfer.
 
-            # figure out full computed blocks to save
+            # save all blocks
             block_ids = blocks.get_block_ids()[0]
-            all_full = request.num_tokens % self.block_size == 0
-            full_block_ids = (block_ids if all_full else block_ids[:-1])
             # TODO: skip the blocks that are already in the host xfer buffer.
             # Currently, the host xfer buffer block is 1-to-1 mapped to device
             # kv blocks, so host blocks won't be flushed as long as its device
             # block is not overwritten; and it will be safe to skip saving them
             # to host xfer buffer.
-            if full_block_ids:
+            if block_ids:
                 self._reqs_need_save[request.request_id] = \
-                    (request, full_block_ids)
+                    (request, block_ids)
         elif params.get("do_remote_prefill"):
             if params.get("remote_block_ids"):
                 if all(p in params for p in ("remote_engine_id", "remote_host",
@@ -382,12 +400,9 @@ class NixlConnectorScheduler:
                 or request.status != RequestStatus.FINISHED_LENGTH_CAPPED):
             return False, None
 
-        # Get computed blocks.
-        all_full = request.num_computed_tokens % self.block_size == 0
-        computed_block_ids = block_ids if all_full else block_ids[:-1]
-
-        # If prompt < block_size, no xfer so free blocks immediately.
-        delay_free_blocks = len(computed_block_ids) > 0
+        # TODO: check whether block_ids actually ever be 0. If not we could
+        # remove the conditional below
+        delay_free_blocks = len(block_ids) > 0
 
         if delay_free_blocks:
             # Prefill request on remote. It will be read from D upon completion
@@ -397,7 +412,7 @@ class NixlConnectorScheduler:
         return delay_free_blocks, dict(
             do_remote_prefill=True,
             do_remote_decode=False,
-            remote_block_ids=computed_block_ids,
+            remote_block_ids=block_ids,
             remote_engine_id=self.engine_id,
             remote_host=self.side_channel_host,
             remote_port=self.side_channel_port,
@@ -527,12 +542,17 @@ class NixlConnectorWorker:
         attn_backend = backend_name_to_enum(self.backend_name)
         self._use_flashinfer = attn_backend == _Backend.FLASHINFER_VLLM_V1
         self._use_pallas_v1 = attn_backend == _Backend.PALLAS_VLLM_V1
+        self.kv_cache_layout = get_kv_cache_layout()
         logger.debug("Detected attention backend %s", self.backend_name)
+        logger.debug("Detected kv cache layout %s", self.kv_cache_layout)
 
         self._tp_size: dict[EngineId, int] = {self.engine_id: self.world_size}
         # With heterogeneous TP, P must wait for all assigned D TP workers to
         # finish reading before safely freeing the blocks.
         self.consumer_notification_counts_by_req = defaultdict[ReqId, int](int)
+
+        self.failure_request = set[ReqId]()
+        self.xfer_timeout = 60.0
 
     def __del__(self):
         """Cleanup background threads on destruction."""
@@ -828,7 +848,8 @@ class NixlConnectorWorker:
             kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id],
             num_blocks=self.num_blocks,
             block_len=self.block_len,
-            attn_backend_name=self.backend_name)
+            attn_backend_name=self.backend_name,
+            kv_cache_layout=self.kv_cache_layout)
         ready_event = threading.Event()
         self._nixl_handshake_listener_t = threading.Thread(
             target=self._nixl_handshake_listener,
@@ -889,8 +910,7 @@ class NixlConnectorWorker:
             self._tp_size[engine_id] = remote_tp_size
         else:
             assert self._tp_size[engine_id] == remote_tp_size
-        # We may eventually enable this after asserting equality in cache
-        # layout and close outputs.
+        # TODO We may eventually want to skip enforcing the same attn backend.
         assert nixl_agent_meta.attn_backend_name == self.backend_name
 
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
@@ -919,6 +939,9 @@ class NixlConnectorWorker:
             if self._use_flashinfer:
                 # Account for joint KV in FlashInfer.
                 remote_block_size //= 2
+            if tp_ratio > 1:
+                # Heterogeneous TP expects same kv_cache_layout.
+                assert nixl_agent_meta.kv_cache_layout == self.kv_cache_layout
 
             assert nixl_agent_meta.block_len == self.block_len * tp_ratio, (
                 "Remote P worker KV layer cache must be of shape [2, N, "
@@ -998,7 +1021,7 @@ class NixlConnectorWorker:
             self.copy_blocks(self.device_kv_caches, self.host_xfer_buffers,
                              meta.local_block_ids, meta.local_block_ids, "d2h")
 
-    def get_finished(self) -> tuple[set[str], set[str]]:
+    def get_finished(self) -> tuple[set[str], set[str], set[str]]:
         """
         Get requests that are done sending or recving on this specific worker.
         The scheduler process (via the MultiprocExecutor) will use this output
@@ -1031,9 +1054,10 @@ class NixlConnectorWorker:
                 "retrieved by %d decode worker(s) within %d seconds.", req_id,
                 count, envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT)
             del self._reqs_to_send[req_id]
-            done_sending.add(req_id)
-
-        return done_sending, done_recving
+            self.failure_request.add(req_id)
+        failure_request = self.failure_request.copy()
+        self.failure_request.clear()
+        return done_sending, done_recving, failure_request
 
     def _get_new_notifs(self) -> set[str]:
         """
@@ -1073,18 +1097,30 @@ class NixlConnectorWorker:
         done_req_ids: set[str] = set()
         for req_id, handles in list(transfers.items()):
             in_progress = False
+            Failed = False
             for handle, _xfer_stime in handles:
                 xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                 if xfer_state == "DONE":
                     self.nixl_wrapper.release_xfer_handle(handle)
                 elif xfer_state == "PROC":
-                    in_progress = True
-                    continue
+                    if time.perf_counter() - _xfer_stime > self.xfer_timeout:
+                        logger.warning("Transfer %d for request %s timed out",
+                                       handle, req_id)
+                        self.nixl_wrapper.release_xfer_handle(handle)
+                        Failed = True
+                    else:
+                        in_progress = True
                 else:
-                    raise RuntimeError("Transfer failed with state %s",
-                                       xfer_state)
+                    logger.error(
+                        "Transfer %d for request %s failed with state: %s",
+                        handle, req_id, xfer_state)
+                    self.nixl_wrapper.release_xfer_handle(handle)
+                    Failed = True
             if not in_progress:
-                done_req_ids.add(req_id)
+                if not Failed:
+                    done_req_ids.add(req_id)
+                else:
+                    self.failure_request.add(req_id)
                 del transfers[req_id]
         return done_req_ids
 
@@ -1209,23 +1245,30 @@ class NixlConnectorWorker:
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 
-        # Prepare transfer with Nixl.
-        handle = self.nixl_wrapper.make_prepped_xfer(
-            "READ",
-            local_xfer_side_handle,
-            local_block_descs_ids,
-            remote_xfer_side_handle,
-            remote_block_descs_ids,
-            notif_msg=notif_id,
-        )
+        handle = None
+        try:
+            # Prepare transfer with Nixl.
+            handle = self.nixl_wrapper.make_prepped_xfer(
+                "READ",
+                local_xfer_side_handle,
+                local_block_descs_ids,
+                remote_xfer_side_handle,
+                remote_block_descs_ids,
+                notif_msg=notif_id,
+            )
+            # Begin async xfer.
+            self.nixl_wrapper.transfer(handle)
 
-        # Begin async xfer.
-        self.nixl_wrapper.transfer(handle)
-
-        # Use handle to check completion in future step().
-        # TODO (NickLucche) surface xfer elapsed time
-        self._recving_transfers[request_id].append(
-            (handle, time.perf_counter()))
+            # Use handle to check completion in future step().
+            # TODO (NickLucche) surface xfer elapsed time
+            self._recving_transfers[request_id].append(
+                (handle, time.perf_counter()))
+        except Exception as e:
+            if handle is not None:
+                self.nixl_wrapper.release_xfer_handle(handle)
+            logger.error("Failed to start NIXL xfer for request %s: %s",
+                         request_id, e)
+            self.failure_request.add(request_id)
 
     def _get_block_descs_ids(self,
                              engine_id: str,
