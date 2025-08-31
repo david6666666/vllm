@@ -12,6 +12,8 @@ The class provides the following primitives:
             times for a given request and should be side-effect free.
         update_state_after_alloc() - update KVConnector state after
             temporary buffer alloc by the CacheManager.
+        update_connector_output() - update KVConnector state after
+            output is received from worker-side connectors.
         request_finished() - called when a request is finished, with
             the computed kv cache blocks for the request.
             Returns whether KV cache should be freed now or will be
@@ -28,6 +30,8 @@ The class provides the following primitives:
 
         get_finished() - called with ids of finished requests, returns
             ids of requests that have completed async sending/recving.
+        get_failure_requests() - called with scheduler output, returns
+            ids of requests that have failed async transfer.
 """
 
 import enum
@@ -38,6 +42,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
@@ -128,8 +133,8 @@ class KVConnectorBase_V1(ABC):
         Initialize with the KV caches. Useful for pre-registering the
         KV Caches in the KVConnector (e.g. for NIXL).
 
-        Args: kv_caches:
-            dictionary of layer names, kv cache
+        Args: 
+            kv_caches: dictionary of layer names, kv cache
         """
         return
 
@@ -219,6 +224,21 @@ class KVConnectorBase_V1(ABC):
         """
         return None, None
 
+    def get_failure_requests(
+            self, scheduler_output: "SchedulerOutput") -> Optional[set[str]]:
+        """
+        Notifies scheduler-side connector ids of requests that have
+        failed during async transfer on the worker.
+        The scheduler process will use this output to track which 
+        requests have failed.
+
+        Returns:
+            ids of requests that have failed asynchronous transfer
+            The failed req ids must belong to a set provided in a
+            call to get_finished().
+        """
+        return None
+
     # ==============================
     # Scheduler-side methods
     # ==============================
@@ -283,6 +303,16 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def update_connector_output(self, connector_output: KVConnectorOutput):
+        """
+        Update KVConnector state from worker-side connectors output.
+
+        Args:
+            connector_output (KVConnectorOutput): the worker-side
+                connectors output.
+        """
+        return
+
     def request_finished(
         self,
         request: "Request",
@@ -299,3 +329,21 @@ class KVConnectorBase_V1(ABC):
             returned by the engine.
         """
         return False, None
+
+    @classmethod
+    def get_required_kvcache_layout(
+            cls, vllm_config: "VllmConfig") -> Optional[str]:
+        """
+        Get the required KV cache layout for this connector.
+        Args:
+            vllm_config (VllmConfig): the vllm config.
+
+        Returns:
+            str: the required KV cache layout. e.g. HND, or NHD.
+            None if the connector does not require a specific layout.
+        """
+
+        if cls is KVConnectorBase_V1:
+            raise TypeError("get_required_kvcache_layout should not be called "
+                            "on the abstract base class")
+        return None

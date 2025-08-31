@@ -40,43 +40,47 @@ Although the first compilation can take some time, for all subsequent server lau
 Use `VLLM_XLA_CACHE_PATH` environment variable to write to shareable storage for future deployed nodes (like when using autoscaling).
 
 #### Reducing compilation time
+
 This initial compilation time ranges significantly and is impacted by many of the arguments discussed in this optimization doc. Factors that influence the length of time to compile are things like model size and `--max-num-batch-tokens`. Other arguments you can tune are things like `VLLM_TPU_MOST_MODEL_LEN`.
 
 ### Optimize based on your data
 
-#### max model len vs. most model len
+#### max-model-len vs. most-model-len
 
-![most_model_len](../assets/design/v1/tpu/most_model_len.png)
+![most_model_len](../assets/design/tpu/most_model_len.png)
 
-If most of your requests are shorter than the maximum model length but you still need to accommodate occasional longer requests, setting a high maximum model length can negatively impact performance. In these cases, you can try introducing most model len by specifying the `VLLM_TPU_MOST_MODEL_LEN` environment variable.
+If most of your requests are shorter than the maximum model length but you still need to accommodate occasional longer requests, setting a high maximum model length can negatively impact performance. In these cases, you can try introducing most-model-len by specifying the `VLLM_TPU_MOST_MODEL_LEN` environment variable.
 
 For example, 1% requests are 32k length and 99% requests are 2k length. You can pass 32k into `--max-model-len 32768` and use `VLLM_TPU_MOST_MODEL_LEN=2048`.
 
-The requests get subdivided into max-model-len and most-model-len categories, for the latter category, we can gain better performance since the server can process more requests at a time.
+The requests get subdivided into max-model-len and most-model-len categories, for the latter category, you can gain better performance since the server can process more requests at a time.
 
 #### Padding
 
-For online serving with latency requirements, consider switching to bucket padding by setting the `VLLM_TPU_BUCKET_PADDING_GAP` environment variable. Because of the layout of the TPU, try using increments of 128: 128, 256, etc.
+For online serving with latency requirements, consider switching to bucket padding by setting the `VLLM_TPU_BUCKET_PADDING_GAP` environment variable. Because of the layout of the TPU, try using increments of 128 (e.g., 128, 256, etc.)
 
-The server pads the requests into fixed lengths before sending them to the model to avoid recompilation. To read more about tpu padding, see [here](https://cloud.google.com/tpu/docs/performance-guide#xla-efficiencies). Currently, there are 2 ways to pad the requests:
+The server pads the requests into fixed lengths before sending them to the model to avoid recompilation. To read more about TPU padding, see [here](https://cloud.google.com/tpu/docs/performance-guide#xla-efficiencies). Currently, there are 2 ways to pad the requests:
 
-1) the default exponential padding (pad to the nearest power of 2)
-2) bucket padding (pad to the nearest linearly increasing bucket).
+1. the default exponential padding (pad to the nearest power of 2)
+2. bucket padding (pad to the nearest linearly increasing bucket).
 
 When using bucket padding, the buckets start from 16, end at max_model_len, and increment by `VLLM_TPU_BUCKET_PADDING_GAP`.
 
 For example, max_model_len=512, padding_gap=64, the buckets will be [16, 32, 64, 128, 192, 256, 320, 384, 448, 512].
 
-The fewer tokens we pad, the less unnecessary computation TPU does, the better performance we can get. For example, if num_tokens=300, with exponential padding, we pad to 512, with the bucket_padding above, we pad to 320.
+The fewer tokens you pad, the less unnecessary computation TPU does, the better performance you can get. For example, if num_tokens=300, with exponential padding, you pad to 512, with the bucket_padding above, you pad to 320.
 
-However, you need to be careful to choose the padding gap. If the gap is too small, it means the number of buckets is large, leading to increased warmup (precompile) time and higher memory to store the compiled graph. Too many compilaed graphs may lead to HBM OOM. Conversely, an overly large gap yields no performance improvement compared to the default exponential padding.
+However, you need to be careful to choose the padding gap. If the gap is too small, it means the number of buckets is large, leading to increased warmup (precompile) time and higher memory to store the compiled graph. Too many compiled graphs may lead to HBM OOM. Conversely, an overly large gap yields no performance improvement compared to the default exponential padding.
 
-**If possible, use the precision that matches the chip’s hardware acceleration**
+#### Quantization
+
+If possible, use the precision that matches the chip’s hardware acceleration:
 
 - v5e has int4/int8 hardware acceleration in the MXU
 - v6e has int4/int8 hardware acceleration in the MXU
 
-Supported quantized formats and features in vLLM on TPU [Jul '25]
+Supported quantized formats and features in vLLM on TPU [Jul '25]:
+
 - INT8 W8A8
 - INT8 W8A16
 - FP8 KV cache
@@ -84,13 +88,15 @@ Supported quantized formats and features in vLLM on TPU [Jul '25]
 - [WIP] AWQ
 - [WIP] FP4 W4A8
 
-**Don't set TP to be less than the number of chips on a single-host deployment**
+#### Parallelization
+
+Don't set TP to be less than the number of chips on a single-host deployment.
 
 Although it’s common to do this with GPUs, don't try to fragment 2 or 8 different workloads across 8 chips on a single host. If you need 1 or 4 chips, just create an instance with 1 or 4 chips (these are partial-host machine types).
 
-### Tune your workloads!
+### Tune your workloads
 
-Although we try to have great default configs, we strongly recommend you check out the [vLLM auto-tuner](../../benchmarks/auto_tune/README.md) to optimize your workloads for your use case.
+Although we try to have great default configs, we strongly recommend you check out the [vLLM auto-tuner](gh-file:benchmarks/auto_tune/README.md) to optimize your workloads for your use case.
 
 ### Future Topics We'll Cover
 
@@ -99,6 +105,7 @@ Although we try to have great default configs, we strongly recommend you check o
 The auto-tuner provides a profile of optimized configurations as its final step. However, interpreting this profile can be challenging for new users. We plan to expand this section in the future with more detailed guidance. In the meantime, you can learn how to collect a TPU profile using vLLM's native profiling tools [here](../examples/offline_inference/profiling_tpu.md). This profile can provide valuable insights into your workload's performance.
 
 #### SPMD
+
 More details to come.
 
 **Want us to cover something that isn't listed here? Open up an issue please and cite this doc. We'd love to hear your questions or tips.**
