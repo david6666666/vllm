@@ -199,9 +199,14 @@ def support_quantized_model_reload_from_hp_weights(original_load_weights):
         # Step R1: First restore the quantized weights to original bfloat16
         # weights, with original metadata (shape, dtype, device)
         # and attributes, so that bfloat16 weights can be loaded properly
-        original_quantized_weight_dict = dict(
-            model.named_parameters(remove_duplicate=False)
-        )
+        original_quantized_weight_dict: dict[
+            str, tuple[torch.nn.Parameter, torch.device]
+        ] = {}
+        for name, param in model.named_parameters(remove_duplicate=False):
+            original_device = param.device
+            if original_device.type == "cuda":
+                param.data = param.data.cpu()
+            original_quantized_weight_dict[name] = (param, original_device)
         named_modules = dict(model.named_modules(remove_duplicate=False))
 
         restore_weights_for_loading(model)
@@ -217,7 +222,7 @@ def support_quantized_model_reload_from_hp_weights(original_load_weights):
         model_device = None
         if original_quantized_weight_dict:
             first_param = next(iter(original_quantized_weight_dict.values()))
-            model_device = first_param.device
+            model_device = first_param[1]
 
         if model_device is not None:
             process_weights_after_loading(model, model_config, model_device)
@@ -229,7 +234,9 @@ def support_quantized_model_reload_from_hp_weights(original_load_weights):
         # Step R5 (workaround for cudagraph): restore the original quantized weights
         # and do a copy_ of the currents weights to the original weights
         updated_quantized_weights = dict(model.named_parameters(remove_duplicate=False))
-        for name, original_quantized_weight in original_quantized_weight_dict.items():
+        for name, (original_quantized_weight, original_device) in (
+            original_quantized_weight_dict.items()
+        ):
             updated_quantized_weight = updated_quantized_weights.get(name)
             if updated_quantized_weight is None:
                 continue
@@ -237,6 +244,10 @@ def support_quantized_model_reload_from_hp_weights(original_load_weights):
             module_name, weight_name = name.rsplit(".", 1)
             module = named_modules[module_name]
             setattr(module, weight_name, original_quantized_weight)
+            if original_quantized_weight.device != original_device:
+                original_quantized_weight.data = original_quantized_weight.data.to(
+                    original_device
+                )
             with torch.no_grad():
                 original_quantized_weight.copy_(updated_quantized_weight)
 
