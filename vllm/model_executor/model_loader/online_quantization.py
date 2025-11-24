@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import types
+from copy import deepcopy
+from types import MethodType
 from collections.abc import Iterable
 
 import torch
@@ -65,19 +66,18 @@ ONLINE_RELOAD_QUANT_METHODS = {"torchao", "awq", "awq_marlin"}
 #    load_weights
 
 
-def maybe_save_metadata_and_attributes_for_weight_reloading(
+def record_weights_for_reloading(
     model: nn.Module, model_config: ModelConfig
-):
-    quant_method = getattr(model_config, "quantization", None)
-    if quant_method not in ONLINE_RELOAD_QUANT_METHODS:
+) -> None:
+    if getattr(model, "weight_metadata_and_attr_saved", False):
         return
 
     from vllm.model_executor.model_loader.weight_utils import get_quant_config
 
+    quant_method = getattr(model_config, "quantization", None)
     quant_config = get_quant_config(model_config, None)
-
-    # For torchao we only need to record metadata when we still have
-    # the original high precision weights around (online quantization).
+    if quant_config.get_name() not in ONLINE_RELOAD_QUANT_METHODS:
+        return
     if quant_method == "torchao":
         if not (
             hasattr(quant_config, "is_checkpoint_torchao_serialized")
@@ -85,59 +85,86 @@ def maybe_save_metadata_and_attributes_for_weight_reloading(
         ):
             return
 
-    # This is the I2 step of online quantiztion that saves
-    # metadata and attributes of weights so they can be used in R1 and
-    # R2 step, note that we only save these during initialization
-
-    # Includes two things
-    # 1. save floating point metadata (shape, dtype, device) for init
-    # 2. save weight attributes, e.g. `output_dim`, `weight_loader` for init
-
-    if getattr(model, "weight_metadata_and_attr_saved", False):
-        return
-
-    # save the dtype, shape and device for model parameter, used for
-    # restoring the model high precision parameters before
-    # reloading the weights
-    assert not hasattr(model, "original_weights_rebuild_keys")
-    model.original_weights_rebuild_keys = {}
-    for name, p in model.named_parameters():
-        model.original_weights_rebuild_keys[name] = {
-            "shape": p.shape,
-            "dtype": p.dtype,
-            "device": p.device,
-        }
-
-    # record the weight attributes (loader functions etc.)
-    # so these can be recovered later when we reload the weights
-    # structure: {"weight_name": {"weight_attr_key": attr}}
-    assert not hasattr(model, "recorded_weight_attr")
-    model.recorded_weight_attr = {}
-    for name, param in model.named_parameters():
-        model.recorded_weight_attr[name] = {}
-        for key in param.__dict__:
-            if hasattr(param, key):
-                attr = getattr(param, key)
-                if not callable(attr):
-                    model.recorded_weight_attr[name][key] = attr
-                elif hasattr(attr, "__self__") and param is attr.__self__:
-                    # if attr is a bonded method for an instance, and
-                    # attr.__self__ points to the instance (param)
-                    # we'll record the underlying function object
-                    model.recorded_weight_attr[name][key] = attr.__func__
-                else:
-                    model.recorded_weight_attr[name][key] = attr
-    # mark the metadata and attributes saved so we don't run it again
+    model.weight_loading_metadata = {
+        name: _copy_to_meta_tensor(param)
+        for name, param in model.named_parameters(remove_duplicate=False)
+    }
     model._model_config = model_config
     model.weight_metadata_and_attr_saved = True
 
 
-def _bond_method_to_cls(func, obj):
-    if hasattr(func, "__self__") or not callable(func):
-        # If the function is already bound to an instance, return it as is
-        return func
-    else:
-        return types.MethodType(func, obj)
+def restore_weights_for_loading(model: nn.Module) -> None:
+    assert hasattr(model, "weight_loading_metadata")
+    metadata: dict[str, torch.Tensor] = model.weight_loading_metadata
+    named_modules = dict(model.named_modules(remove_duplicate=False))
+    current_params = dict(model.named_parameters(remove_duplicate=False)).keys()
+
+    for name in list(current_params):
+        if name not in metadata:
+            module_name, param_name = name.rsplit(".", 1)
+            module = named_modules[module_name]
+            delattr(module, param_name)
+
+    for name, meta_tensor in metadata.items():
+        module_name, param_name = name.rsplit(".", 1)
+        module = named_modules.get(module_name)
+        if module is None:
+            continue
+
+        current_param = getattr(module, param_name, None)
+        if _tensors_alike(current_param, meta_tensor):
+            continue
+
+        param = _materialize_meta_tensor(meta_tensor)
+        setattr(module, param_name, param)
+
+
+def _copy_to_meta_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    meta_tensor = tensor.to("meta")
+    meta_tensor.__class__ = tensor.__class__
+    meta_tensor.__dict__ = deepcopy(tensor.__dict__)
+    meta_tensor.__dict__["_original_device"] = tensor.device
+    return meta_tensor
+
+
+def _tensors_alike(
+    tensor: torch.Tensor | None, meta_tensor: torch.Tensor
+) -> bool:
+    if tensor is None:
+        return False
+
+    meta_dict = {
+        key: value for key, value in meta_tensor.__dict__.items() if key != "_original_device"
+    }
+    tensor_dict = {
+        key: value for key, value in tensor.__dict__.items() if key != "_original_device"
+    }
+
+    return (
+        tensor.device
+        == meta_tensor.__dict__.get("_original_device", meta_tensor.device)
+        and tensor.dtype == meta_tensor.dtype
+        and tensor.shape == meta_tensor.shape
+        and tensor_dict == meta_dict
+    )
+
+
+def _materialize_meta_tensor(meta_tensor: torch.Tensor) -> torch.Tensor:
+    meta_dict = deepcopy(meta_tensor.__dict__)
+    original_device = meta_dict.pop("_original_device", meta_tensor.device)
+    tensor = torch.empty_strided(
+        size=tuple(meta_tensor.size()),
+        stride=tuple(meta_tensor.stride()),
+        dtype=meta_tensor.dtype,
+        device=original_device,
+        requires_grad=meta_tensor.requires_grad,
+    )
+    tensor.__class__ = meta_tensor.__class__
+    tensor.__dict__ = meta_dict
+    for key, value in list(tensor.__dict__.items()):
+        if isinstance(value, MethodType):
+            setattr(tensor, key, MethodType(value.__func__, tensor))
+    return tensor
 
 
 def support_quantized_model_reload_from_hp_weights(original_load_weights):
@@ -154,81 +181,23 @@ def support_quantized_model_reload_from_hp_weights(original_load_weights):
         auto_weight_loader, weights: Iterable[tuple[str, torch.Tensor]], *, mapper=None
     ) -> set[str]:
         model = auto_weight_loader.module
-        offline_quantization_or_first_run_of_online_quantization = not getattr(
-            model, "weight_metadata_and_attr_saved", False
-        )
-
-        # if we don't have `model.weight_metadata_and_attr_saved` defined and
-        # set to True, it means that this is either offline quantization case
-        # or the first run of online quantization
-        # see Notes in this file for more details
-        if offline_quantization_or_first_run_of_online_quantization:
-            # case 1: offline quantized checkpoint
-            # case 2: Step I1 first run of weight loading with
-            # online quantization
+        if not getattr(model, "weight_metadata_and_attr_saved", False):
             return original_load_weights(auto_weight_loader, weights, mapper=mapper)
 
         model_config = getattr(model, "_model_config", None)
         quant_method = getattr(model_config, "quantization", None)
         if quant_method not in ONLINE_RELOAD_QUANT_METHODS:
             return original_load_weights(auto_weight_loader, weights, mapper=mapper)
-        # TODO: use create_weights to restore the weights to original state
 
         # Step R1: First restore the quantized weights to original bfloat16
         # weights, with original metadata (shape, dtype, device)
         # and attributes, so that bfloat16 weights can be loaded properly
-        # TODO: maybe set remove_duplicate to True?
         original_quantized_weight_dict = dict(
             model.named_parameters(remove_duplicate=False)
         )
         named_modules = dict(model.named_modules(remove_duplicate=False))
-        model_device = None
 
-        for name, d in model.original_weights_rebuild_keys.items():
-            _shape = d["shape"]
-            _dtype = d["dtype"]
-            _device = d["device"]
-            if model_device is not None:
-                assert model_device == _device, (
-                    "Expecting all weights "
-                    "to be in the same device for now, got both: "
-                    f"{model_device} and {_device}"
-                )
-            else:
-                model_device = _device
-
-            if name in original_quantized_weight_dict:
-                module_name, weight_name = name.rsplit(".", 1)
-                module = named_modules[module_name]
-                setattr(
-                    module,
-                    weight_name,
-                    torch.nn.Parameter(
-                        torch.empty(_shape, dtype=_dtype, device=_device),
-                        requires_grad=False,
-                    ),
-                )
-
-        # Step R2: recover the weight attributes to the state before first loading
-        # recorded_weight_attr is
-        # {"weight_name": {"weight_attr_key": attr}}
-        # e.g.
-        # {
-        #   {
-        #     "layer.0.weight": {
-        #       "weight_loader": weight_loader_function_object,
-        #       "input_dim": 0, ...
-        #     },
-        #     "layer.1.weight": ...,
-        #    }
-        # }
-        for full_weight_name, weight_attr_dict in model.recorded_weight_attr.items():
-            for attr_name, attr in weight_attr_dict.items():
-                module_name, weight_name = full_weight_name.rsplit(".", 1)
-                module = named_modules[module_name]
-                weight = getattr(module, weight_name)
-                if not hasattr(weight, attr_name):
-                    setattr(weight, attr_name, _bond_method_to_cls(attr, weight))
+        restore_weights_for_loading(model)
 
         # Step R3: reload bfloat16 / high precision weights
         updated_params = original_load_weights(
@@ -238,6 +207,11 @@ def support_quantized_model_reload_from_hp_weights(original_load_weights):
         # Step R4: online quantize the weights
         # manually process weights after loading
         model.process_weights_after_loading_already_called = False
+        model_device = None
+        if original_quantized_weight_dict:
+            first_param = next(iter(original_quantized_weight_dict.values()))
+            model_device = first_param.device
+
         if model_device is not None:
             process_weights_after_loading(model, model_config, model_device)
         else:
@@ -248,20 +222,19 @@ def support_quantized_model_reload_from_hp_weights(original_load_weights):
         # Step R5 (workaround for cudagraph): restore the original quantized weights
         # and do a copy_ of the currents weights to the original weights
         updated_quantized_weights = dict(model.named_parameters(remove_duplicate=False))
-        for name in model.original_weights_rebuild_keys:
-            if name in original_quantized_weight_dict:
-                original_quantized_weight = original_quantized_weight_dict[name]
-                updated_quantized_weight = updated_quantized_weights[name]
+        for name, original_quantized_weight in original_quantized_weight_dict.items():
+            updated_quantized_weight = updated_quantized_weights.get(name)
+            if updated_quantized_weight is None:
+                continue
 
-                module_name, weight_name = name.rsplit(".", 1)
-                module = named_modules[module_name]
-                setattr(module, weight_name, original_quantized_weight)
-                with torch.no_grad():
-                    original_quantized_weight.copy_(updated_quantized_weight)
+            module_name, weight_name = name.rsplit(".", 1)
+            module = named_modules[module_name]
+            setattr(module, weight_name, original_quantized_weight)
+            with torch.no_grad():
+                original_quantized_weight.copy_(updated_quantized_weight)
 
         del original_quantized_weight_dict
         del named_modules
-        del updated_quantized_weight
 
         model.process_weights_after_loading_already_called = True
         return updated_params
