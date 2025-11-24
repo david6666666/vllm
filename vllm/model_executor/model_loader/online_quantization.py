@@ -122,8 +122,19 @@ def restore_weights_for_loading(model: nn.Module) -> None:
 def _copy_to_meta_tensor(tensor: torch.Tensor) -> torch.Tensor:
     meta_tensor = tensor.to("meta")
     meta_tensor.__class__ = tensor.__class__
-    meta_tensor.__dict__ = deepcopy(tensor.__dict__)
-    meta_tensor.__dict__["_original_device"] = tensor.device
+
+    attr_state: dict[str, tuple[str, object]] = {}
+    for key, value in tensor.__dict__.items():
+        if isinstance(value, MethodType) and value.__self__ is tensor:
+            attr_state[key] = ("method", value.__func__)
+            continue
+        try:
+            attr_state[key] = ("value", deepcopy(value))
+        except Exception:
+            attr_state[key] = ("value", value)
+
+    setattr(meta_tensor, "_original_device", tensor.device)
+    setattr(meta_tensor, "_attr_state", attr_state)
     return meta_tensor
 
 
@@ -133,25 +144,16 @@ def _tensors_alike(
     if tensor is None:
         return False
 
-    meta_dict = {
-        key: value for key, value in meta_tensor.__dict__.items() if key != "_original_device"
-    }
-    tensor_dict = {
-        key: value for key, value in tensor.__dict__.items() if key != "_original_device"
-    }
-
     return (
         tensor.device
-        == meta_tensor.__dict__.get("_original_device", meta_tensor.device)
+        == getattr(meta_tensor, "_original_device", meta_tensor.device)
         and tensor.dtype == meta_tensor.dtype
         and tensor.shape == meta_tensor.shape
-        and tensor_dict == meta_dict
     )
 
 
 def _materialize_meta_tensor(meta_tensor: torch.Tensor) -> torch.Tensor:
-    meta_dict = deepcopy(meta_tensor.__dict__)
-    original_device = meta_dict.pop("_original_device", meta_tensor.device)
+    original_device = getattr(meta_tensor, "_original_device", meta_tensor.device)
     tensor = torch.empty_strided(
         size=tuple(meta_tensor.size()),
         stride=tuple(meta_tensor.stride()),
@@ -160,10 +162,15 @@ def _materialize_meta_tensor(meta_tensor: torch.Tensor) -> torch.Tensor:
         requires_grad=meta_tensor.requires_grad,
     )
     tensor.__class__ = meta_tensor.__class__
-    tensor.__dict__ = meta_dict
-    for key, value in list(tensor.__dict__.items()):
-        if isinstance(value, MethodType):
-            setattr(tensor, key, MethodType(value.__func__, tensor))
+    attr_state = getattr(meta_tensor, "_attr_state", {})
+    for key, (kind, value) in attr_state.items():
+        if kind == "method":
+            setattr(tensor, key, MethodType(value, tensor))
+        else:
+            try:
+                setattr(tensor, key, deepcopy(value))
+            except Exception:
+                setattr(tensor, key, value)
     return tensor
 
 
