@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
 logger = init_logger(__name__)
+ONLINE_RELOAD_QUANT_METHODS = {"torchao", "awq", "awq_marlin"}
 
 # Notes for Online Quantization
 # In terms of state of checkpoints, quantization config and their
@@ -67,27 +68,22 @@ logger = init_logger(__name__)
 def maybe_save_metadata_and_attributes_for_weight_reloading(
     model: nn.Module, model_config: ModelConfig
 ):
-    # following is to support on the fly quantization, currently only supported
-    # for torchao
-    if model_config.quantization != "torchao":
+    quant_method = getattr(model_config, "quantization", None)
+    if quant_method not in ONLINE_RELOAD_QUANT_METHODS:
         return
 
     from vllm.model_executor.model_loader.weight_utils import get_quant_config
 
     quant_config = get_quant_config(model_config, None)
 
-    # If checkpoint is already torchao serialized, this means it's
-    # pre-quantized quantization case, we'll skip saving the metadata
-    # Otherwise, this is Step I2 of initialization steps of
-    # online quantization
-    # This step record the weights metadata and weight attributes so we can
-    # restore the bfloat16 model weights during the relad step (R1 and R2)
-    # see Notes in online_quantization.py for more details
-    if not (
-        hasattr(quant_config, "is_checkpoint_torchao_serialized")
-        and not quant_config.is_checkpoint_torchao_serialized
-    ):
-        return
+    # For torchao we only need to record metadata when we still have
+    # the original high precision weights around (online quantization).
+    if quant_method == "torchao":
+        if not (
+            hasattr(quant_config, "is_checkpoint_torchao_serialized")
+            and not quant_config.is_checkpoint_torchao_serialized
+        ):
+            return
 
     # This is the I2 step of online quantiztion that saves
     # metadata and attributes of weights so they can be used in R1 and
@@ -172,12 +168,10 @@ def support_quantized_model_reload_from_hp_weights(original_load_weights):
             # online quantization
             return original_load_weights(auto_weight_loader, weights, mapper=mapper)
 
-        model_config = model._model_config
-
-        # TODO: Add fp8 support
-        assert model_config.quantization == "torchao", (
-            "online quantization is only enabled for torchao currently"
-        )
+        model_config = getattr(model, "_model_config", None)
+        quant_method = getattr(model_config, "quantization", None)
+        if quant_method not in ONLINE_RELOAD_QUANT_METHODS:
+            return original_load_weights(auto_weight_loader, weights, mapper=mapper)
         # TODO: use create_weights to restore the weights to original state
 
         # Step R1: First restore the quantized weights to original bfloat16

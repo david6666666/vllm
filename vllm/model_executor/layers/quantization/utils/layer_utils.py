@@ -2,7 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from types import MethodType
+
 import torch
+
+_ATTRS_TO_SKIP = {
+    "grad",
+    "_grad",
+    "_grad_fn",
+    "_is_replica",
+    "_backward_hooks",
+    "_forward_hooks",
+    "_forward_pre_hooks",
+    "_non_persistent_buffers_set",
+}
 
 
 def update_tensor_inplace(dst: torch.Tensor, src: torch.Tensor):
@@ -32,10 +45,20 @@ def replace_parameter(
         #   can be faster if the underlying storage is the same
         update_tensor_inplace(old, new)
     else:
-        # Fallback re-register parameter, convert to Parameter if necessary
-        # this not only ensures we don't register a tensor as a parameter, but
-        # also ensures that all parameter subclasses get re-registered as
-        # parameters for `torch.compile` compatibility
-        if not isinstance(new, torch.nn.Parameter):
-            new = torch.nn.Parameter(new, requires_grad=False)
-        mod.register_parameter(name, torch.nn.Parameter(new, requires_grad=False))
+        # Fallback re-register parameter when metadata changes
+        new_param = new if isinstance(new, torch.nn.Parameter) else None
+        if new_param is None:
+            new_param = torch.nn.Parameter(new, requires_grad=old.requires_grad)
+        _copy_parameter_metadata(old, new_param)
+        mod.register_parameter(name, new_param)
+
+
+def _copy_parameter_metadata(old: torch.nn.Parameter,
+                             new: torch.nn.Parameter) -> None:
+    """Copy custom attributes from the original parameter to the replacement."""
+    for attr, value in old.__dict__.items():
+        if attr in _ATTRS_TO_SKIP:
+            continue
+        if isinstance(value, MethodType) and value.__self__ is old:
+            value = MethodType(value.__func__, new)
+        setattr(new, attr, value)
