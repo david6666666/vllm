@@ -154,11 +154,17 @@ def _tensors_alike(
 
 def _materialize_meta_tensor(meta_tensor: torch.Tensor) -> torch.Tensor:
     original_device = getattr(meta_tensor, "_original_device", meta_tensor.device)
+    target_device = (
+        torch.device("cpu")
+        if isinstance(original_device, torch.device)
+        and original_device.type == "cuda"
+        else original_device
+    )
     tensor = torch.empty_strided(
         size=tuple(meta_tensor.size()),
         stride=tuple(meta_tensor.stride()),
         dtype=meta_tensor.dtype,
-        device=original_device,
+        device=target_device,
         requires_grad=meta_tensor.requires_grad,
     )
     tensor.__class__ = meta_tensor.__class__
