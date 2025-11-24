@@ -247,15 +247,13 @@ def support_quantized_model_reload_from_hp_weights(original_load_weights):
             if updated_quantized_weight is None:
                 continue
 
+            updated_data_cpu = updated_quantized_weight.data.cpu()
+
             module_name, weight_name = name.rsplit(".", 1)
             module = named_modules[module_name]
             setattr(module, weight_name, original_quantized_weight)
-            if original_quantized_weight.device != original_device:
-                original_quantized_weight.data = original_quantized_weight.data.to(
-                    original_device
-                )
             with torch.no_grad():
-                original_quantized_weight.copy_(updated_quantized_weight)
+                original_quantized_weight.data = updated_data_cpu.to(original_device)
 
         del original_quantized_weight_dict
         del named_modules
